@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html, re, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
@@ -12,7 +13,7 @@ BASE='https://figure-online.net'
 SALE=BASE+'/collections/sale'
 OUT=Path('site')
 TARGETS=['AURALEE','COMOLI','Graphpaper','A.PRESSE','marka','DAIWA PIER39','ATON','UNDERCOVER','FACETASM','White Mountaineering','beautiful people','JUNYA WATANABE MAN','Hender Scheme','visvim','WTAPS','nonnative']
-HEADERS={'User-Agent':'Mozilla/5.0 (compatible; DomesticSaleMVP/0.3; +https://github.com/musaonowaka/domestic-sale-site)'}
+HEADERS={'User-Agent':'Mozilla/5.0 (compatible; DomesticSaleMVP/0.4; +https://github.com/musaonowaka/domestic-sale-site)'}
 YEN=re.compile(r'¥\s*([0-9,]+)')
 
 def clean(s): return ' '.join((s or '').split())
@@ -25,33 +26,7 @@ def brand_for(text):
         if b.casefold() in low: return b
     return None
 
-def img_url(img):
-    if not img: return ''
-    srcset=clean(img.get('data-srcset') or img.get('srcset') or '')
-    if srcset:
-        candidates=[]
-        for part in srcset.split(','):
-            bit=part.strip().split()
-            if bit: candidates.append(bit[0])
-        if candidates:
-            return urljoin(BASE,candidates[-1].replace('{width}','720'))
-    for attr in ('data-src','data-original','data-lazy-src','src'):
-        value=clean(img.get(attr,''))
-        if value and not value.startswith('data:'):
-            return urljoin(BASE,value.replace('{width}','720'))
-    return ''
-
-def build_image_map(soup):
-    images={}
-    for a in soup.select('a[href*="/products/"]'):
-        img=a.select_one('img')
-        u=img_url(img)
-        if not u: continue
-        href=urljoin(BASE,a.get('href','')).split('?')[0]
-        images.setdefault(href,u)
-    return images
-
-def parse_card(card,image_map):
+def parse_card(card):
     text=clean(card.get_text(' ',strip=True))
     brand=brand_for(text)
     if not brand: return None
@@ -67,8 +42,41 @@ def parse_card(card,image_map):
     title=re.sub(r'\s*¥\s*[0-9,]+.*$','',title).strip()
     discount=round((1-sale/original)*100)
     sold=bool(re.search(r'\bSOLD\b|SOLD OUT|売り切れ|在庫なし',text,re.I))
-    image=image_map.get(href) or img_url(card.select_one('img'))
-    return {'brand':brand,'title':title,'sale':sale,'original':original,'discount':discount,'url':href,'sold':sold,'image':image}
+    return {'brand':brand,'title':title,'sale':sale,'original':original,'discount':discount,'url':href,'sold':sold,'image':''}
+
+def product_image(url):
+    try:
+        r=requests.get(url,headers=HEADERS,timeout=15)
+        r.raise_for_status()
+        soup=BeautifulSoup(r.text,'html.parser')
+        selectors=[
+            'meta[property="og:image:secure_url"]',
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]',
+            'link[rel="image_src"]',
+        ]
+        for sel in selectors:
+            node=soup.select_one(sel)
+            if not node: continue
+            value=node.get('content') or node.get('href') or ''
+            value=clean(value)
+            if value:
+                return urljoin(BASE,value)
+        for img in soup.select('main img, [class*="product"] img'):
+            for attr in ('data-src','data-original','data-lazy-src','src'):
+                value=clean(img.get(attr,''))
+                if value and not value.startswith('data:'):
+                    return urljoin(BASE,value.replace('{width}','720'))
+    except Exception:
+        return ''
+    return ''
+
+def enrich_images(items):
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures={pool.submit(product_image,x['url']):x for x in items}
+        for f in as_completed(futures):
+            futures[f]['image']=f.result()
+    return items
 
 def fetch():
     session=requests.Session(); session.headers.update(HEADERS)
@@ -76,7 +84,6 @@ def fetch():
     for page in range(1,31):
         r=session.get(SALE,params={'page':page},timeout=25); r.raise_for_status()
         soup=BeautifulSoup(r.text,'html.parser')
-        image_map=build_image_map(soup)
         cards=soup.select('.product-item,.product-card,.grid-product,.productgrid--item,li[class*="product"],div[class*="product-item"]')
         if not cards:
             links=soup.select('a[href*="/products/"]')
@@ -91,11 +98,12 @@ def fetch():
                     seen.add(id(p)); cards.append(p)
         before=len(found)
         for c in cards:
-            item=parse_card(c,image_map)
+            item=parse_card(c)
             if item: found[item['url']]=item
         if page>1 and len(found)==before: break
-        time.sleep(1.2)
-    return list(found.values())
+        time.sleep(1.0)
+    items=list(found.values())
+    return enrich_images(items)
 
 def build(items):
     OUT.mkdir(exist_ok=True); (OUT/'.nojekyll').write_text('',encoding='utf-8')
